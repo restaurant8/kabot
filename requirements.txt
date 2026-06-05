@@ -1,0 +1,1 @@
+# kabot intentionally uses only the Python standard library.
