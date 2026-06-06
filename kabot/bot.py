@@ -140,9 +140,9 @@ class BotApp:
             elif command == "/affiliate":
                 self.show_affiliate(chat_id, telegram_user_id)
             elif command == "/login":
-                self.ask_login_email(chat_id, telegram_user_id)
+                self.handle_telegram_login(chat_id, telegram_user_id, tg_user)
             elif command == "/guest":
-                self.ask_guest_email(chat_id, telegram_user_id)
+                self.handle_telegram_login(chat_id, telegram_user_id, tg_user)
             elif command == "/admin":
                 self.show_admin(chat_id, telegram_user_id)
             else:
@@ -433,10 +433,7 @@ class BotApp:
         ])
 
     def auth_keyboard(self, user_id: int, tg_user: dict[str, Any] | None = None) -> dict[str, Any]:
-        rows = [
-            [self.cb(user_id, "邮箱登录", "login"), self.cb(user_id, "游客模式", "guest")],
-            [self.cb(user_id, "注册账号", "register")],
-        ]
+        rows: list[list[dict[str, Any]]] = []
         if self.settings.enable_synthetic_telegram_login:
             rows.insert(0, [self.cb(user_id, "Telegram 登录", "telegram_login", {"telegram_user": tg_user})])
         rows.append([self.cb(user_id, "返回", "main")])
@@ -453,7 +450,12 @@ class BotApp:
         token = self.get_user_token(telegram_user_id)
         if token:
             return token
-        text = "这个功能需要登录站点账号。也可以先保存游客订单凭据用于查单。"
+        token, error = self.auto_telegram_login(telegram_user_id)
+        if token:
+            return token
+        text = "这个功能需要 Telegram 登录。"
+        if error:
+            text += f"\n\n登录失败：{html_escape(error)}"
         if message:
             self.send_or_edit(chat_id, message, text, self.auth_keyboard(telegram_user_id))
         else:
@@ -473,11 +475,14 @@ class BotApp:
                     self.dujiao.affiliate_click(code, f"tg:{telegram_user_id}", referrer="telegram_bot")
                 except DujiaoError:
                     LOG.debug("affiliate click failed", exc_info=True)
+        _, login_error = self.auto_telegram_login(telegram_user_id, tg_user)
         site_name = self.site_name()
         text = (
             f"欢迎使用 <b>{html_escape(site_name)}</b> Telegram Bot。\n\n"
             "你可以在这里浏览商品、创建订单、支付、查看交付内容，也可以查询钱包、会员和分销数据。"
         )
+        if login_error:
+            text += f"\n\nTelegram 自动登录暂未完成：{html_escape(login_error)}"
         self.send(chat_id, text, self.main_keyboard(telegram_user_id))
 
     def show_main(self, chat_id: int, telegram_user_id: int, message: dict[str, Any] | None = None) -> None:
@@ -723,12 +728,14 @@ class BotApp:
     def show_order_preview(self, chat_id: int, telegram_user_id: int, cart: dict[str, Any], message: dict[str, Any] | None = None) -> None:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
-        if not token and (not user.get("guest_email") or not user.get("guest_order_password")):
-            self.send_or_edit(chat_id, message or {}, "创建订单前需要登录，或保存游客邮箱和订单查询密码。", self.auth_keyboard(telegram_user_id))
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
             return
-        body = self.order_payload(cart, user, include_guest=not bool(token))
+        user = self.db.get_user(telegram_user_id) or user
+        body = self.order_payload(cart, user, include_guest=False)
         try:
-            preview = self.dujiao.preview_order(token, body) if token else self.dujiao.guest_preview_order(body)
+            preview = self.dujiao.preview_order(token, body)
             lines = self.format_preview(preview, cart)
         except DujiaoError as exc:
             lines = [
@@ -747,11 +754,13 @@ class BotApp:
     def create_order(self, chat_id: int, telegram_user_id: int, cart: dict[str, Any], message: dict[str, Any] | None = None) -> None:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
-        if not token and (not user.get("guest_email") or not user.get("guest_order_password")):
-            self.send_or_edit(chat_id, message or {}, "游客下单需要先保存邮箱和订单查询密码。", self.auth_keyboard(telegram_user_id))
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
             return
-        body = self.order_payload(cart, user, include_guest=not bool(token))
-        order = self.dujiao.create_order(token, body) if token else self.dujiao.guest_create_order(body)
+        user = self.db.get_user(telegram_user_id) or user
+        body = self.order_payload(cart, user, include_guest=False)
+        order = self.dujiao.create_order(token, body)
         order_no = str(_first(order.get("order_no"), order.get("no"), order.get("trade_no")))
         status = _first(order.get("status"), order.get("order_status"), default="pending_payment")
         self.db.cache_order(
@@ -784,10 +793,11 @@ class BotApp:
     def create_payment(self, chat_id: int, telegram_user_id: int, order_no: str, channel_id: int, message: dict[str, Any] | None = None) -> None:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
-        if token:
-            payment = self.dujiao.create_payment(token, order_no, channel_id)
-        else:
-            payment = self.dujiao.guest_create_payment(user.get("guest_email", ""), user.get("guest_order_password", ""), order_no, channel_id)
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
+            return
+        payment = self.dujiao.create_payment(token, order_no, channel_id)
         payment_id = _int(_first(payment.get("payment_id"), payment.get("id")), 0)
         self.db.cache_order(order_no, telegram_user_id=telegram_user_id, status=None, payload={"payment": payment}, payment_id=payment_id, channel_id=channel_id)
         text, rows = self.payment_view(telegram_user_id, order_no, payment)
@@ -802,14 +812,12 @@ class BotApp:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
         payment_id = _int(payload.get("payment_id"), 0)
-        if token:
-            payment = self.dujiao.capture_payment(token, payment_id) if payment_id else self.dujiao.latest_payment(token, order_no)
-            order = self.dujiao.order_detail(token, order_no)
-        else:
-            email = user.get("guest_email", "")
-            password = user.get("guest_order_password", "")
-            payment = self.dujiao.guest_capture_payment(payment_id, email, password) if payment_id else self.dujiao.guest_latest_payment(email, password, order_no)
-            order = self.dujiao.guest_order_detail(order_no, email, password)
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
+            return
+        payment = self.dujiao.capture_payment(token, payment_id) if payment_id else self.dujiao.latest_payment(token, order_no)
+        order = self.dujiao.order_detail(token, order_no)
         status = _first(order.get("status"), order.get("order_status"))
         self.db.cache_order(order_no, telegram_user_id=telegram_user_id, status=status, payload=order, payment_id=payment_id or None)
         if str(status) in {"paid", "processing", "fulfilling", "partially_delivered", "delivered", "completed"}:
@@ -847,17 +855,12 @@ class BotApp:
         token = user.get("user_token")
         rows: list[list[dict[str, Any]]] = []
         lines = ["<b>我的订单</b>"]
-        if token:
-            result = self.dujiao.orders(token, page=page, page_size=8)
-            orders = _items(result)
-        elif user.get("guest_email") and user.get("guest_order_password"):
-            result = self.dujiao.guest_orders(user["guest_email"], user["guest_order_password"], page=page, page_size=8)
-            orders = _items(result)
-        else:
-            orders = self.db.recent_orders(telegram_user_id, 8)
-            if not orders:
-                self.send_or_edit(chat_id, message or {}, "还没有登录或保存游客查单凭据。", self.auth_keyboard(telegram_user_id))
-                return
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
+            return
+        result = self.dujiao.orders(token, page=page, page_size=8)
+        orders = _items(result)
         for order in orders:
             order_no = str(_first(order.get("order_no"), order.get("no"), order.get("trade_no")))
             status = _first(order.get("status"), order.get("order_status"))
@@ -886,17 +889,11 @@ class BotApp:
     ) -> None:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
-        if token:
-            order = self.dujiao.order_detail(token, order_no)
-        else:
-            email = guest_email or user.get("guest_email")
-            password = guest_password or user.get("guest_order_password")
-            if not email or not password:
-                cached = self.db.get_cached_order(order_no)
-                order = cached.get("payload") if cached else {}
-            else:
-                order = self.dujiao.guest_order_detail(order_no, email, password)
-                self.db.set_guest_credentials(telegram_user_id, email, password)
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
+            return
+        order = self.dujiao.order_detail(token, order_no)
         status = _first(order.get("status"), order.get("order_status"))
         amount = _first(order.get("total_amount"), order.get("amount"), order.get("pay_amount"))
         lines = [
@@ -924,10 +921,11 @@ class BotApp:
     def cancel_order(self, chat_id: int, telegram_user_id: int, order_no: str, message: dict[str, Any] | None = None) -> None:
         user = self.db.get_user(telegram_user_id) or {}
         token = user.get("user_token")
-        if token:
-            result = self.dujiao.cancel_order(token, order_no)
-        else:
-            result = self.dujiao.guest_cancel_order(order_no, user.get("guest_email", ""), user.get("guest_order_password", ""))
+        if not token:
+            token = self.require_auth(chat_id, telegram_user_id, message)
+        if not token:
+            return
+        result = self.dujiao.cancel_order(token, order_no)
         status = _first(result.get("status"), result.get("order_status"), default="canceled")
         self.db.cache_order(order_no, telegram_user_id=telegram_user_id, status=status, payload=result)
         self.send_or_edit(chat_id, message or {}, f"订单已取消：<code>{html_escape(order_no)}</code>", self.main_keyboard(telegram_user_id))
@@ -962,21 +960,37 @@ class BotApp:
         self.send(chat_id, "注册完成。", self.main_keyboard(telegram_user_id))
 
     def handle_telegram_login(self, chat_id: int, telegram_user_id: int, tg_user: dict[str, Any], message: dict[str, Any] | None = None) -> None:
+        token, error = self.auto_telegram_login(telegram_user_id, tg_user)
+        if not token:
+            raise DujiaoError(error or "Telegram 登录失败")
+        self.send_or_edit(chat_id, message or {}, "Telegram 登录成功。", self.main_keyboard(telegram_user_id))
+
+    def auto_telegram_login(self, telegram_user_id: int, tg_user: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
+        if not self.settings.enable_synthetic_telegram_login:
+            return None, "当前未启用 Telegram 登录"
+        user = self.db.get_user(telegram_user_id) or {}
         if not tg_user:
-            db_user = self.db.get_user(telegram_user_id) or {}
             tg_user = {
                 "id": telegram_user_id,
-                "first_name": db_user.get("first_name") or "",
-                "last_name": db_user.get("last_name") or "",
-                "username": db_user.get("username") or "",
+                "first_name": user.get("first_name") or "",
+                "last_name": user.get("last_name") or "",
+                "username": user.get("username") or "",
             }
-        payload = build_telegram_login_payload(tg_user, self.settings.telegram_login_bot_token)
-        result = self.dujiao.telegram_login(payload)
-        token = str(_first(result.get("token"), result.get("access_token")))
-        if not token:
-            raise DujiaoError("Telegram 登录成功但响应中没有 token")
-        self.db.set_user_token(telegram_user_id, token, result.get("expires_at") or result.get("token_expires_at"), result.get("user") or result)
-        self.send_or_edit(chat_id, message or {}, "Telegram 登录成功。", self.main_keyboard(telegram_user_id))
+        try:
+            payload = build_telegram_login_payload(tg_user, self.settings.telegram_login_bot_token)
+            result = self.dujiao.telegram_login(payload)
+            token = str(_first(result.get("token"), result.get("access_token")))
+            if not token:
+                return None, "站点没有返回 token"
+            self.db.set_user_token(
+                telegram_user_id,
+                token,
+                result.get("expires_at") or result.get("token_expires_at"),
+                result.get("user") or result,
+            )
+            return token, None
+        except DujiaoError as exc:
+            return None, str(exc)
 
     def show_wallet(self, chat_id: int, telegram_user_id: int, message: dict[str, Any] | None = None) -> None:
         token = self.require_auth(chat_id, telegram_user_id, message)

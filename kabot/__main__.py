@@ -85,8 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             {"command": "orders", "description": "查看订单"},
             {"command": "wallet", "description": "查看钱包"},
             {"command": "affiliate", "description": "分销推广"},
-            {"command": "login", "description": "登录站点账号"},
-            {"command": "guest", "description": "保存游客查单凭据"},
+            {"command": "login", "description": "Telegram 登录"},
             {"command": "admin", "description": "管理员菜单"},
         ]
         result = app.telegram.set_my_commands(commands)
