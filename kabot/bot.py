@@ -514,7 +514,8 @@ class BotApp:
         current: list[dict[str, Any]] = []
         for category in categories:
             label = pick_i18n(category.get("name") or category.get("title"), self.settings.default_locale) or f"分类 {category.get('id')}"
-            current.append(self.cb(telegram_user_id, label[:24], "products", {"category_id": category.get("id"), "page": 1}))
+            stock_label = self.category_stock_label(category.get("id"))
+            current.append(self.cb(telegram_user_id, f"{stock_label} {label}"[:32], "products", {"category_id": category.get("id"), "page": 1}))
             if len(current) == 2:
                 rows.append(current)
                 current = []
@@ -546,9 +547,11 @@ class BotApp:
             title = self.product_title(product)
             price = self.product_price(product)
             stock = self.product_stock(product)
+            stock_state = "有货" if self.product_has_stock(product) else "无货"
             lines.append(f"\n<b>{html_escape(title)}</b>\n价格：{html_escape(price)}\n库存：{html_escape(stock)}")
+            lines.append(f"状态：{stock_state}")
             slug = str(_first(product.get("slug"), product.get("id")))
-            rows.append([self.cb(telegram_user_id, f"查看 {title[:16]}", "product", {"slug": slug})])
+            rows.append([self.cb(telegram_user_id, f"[{stock_state}] {title[:14]}", "product", {"slug": slug})])
         nav: list[dict[str, Any]] = []
         if page > 1:
             nav.append(self.cb(telegram_user_id, "上一页", "products", {"category_id": category_id, "page": page - 1, "keyword": keyword}))
@@ -588,9 +591,15 @@ class BotApp:
         if skus:
             for sku in skus[:20]:
                 label = self.sku_label(sku)
-                rows.append([self.cb(telegram_user_id, f"购买 {label[:24]}", "buy", {"slug": slug, "sku_id": sku.get("id")})])
+                if self.sku_has_stock(sku):
+                    rows.append([self.cb(telegram_user_id, f"[有货] {label[:22]}", "buy", {"slug": slug, "sku_id": sku.get("id")})])
+                else:
+                    rows.append([self.cb(telegram_user_id, f"[无货] {label[:22]}", "subscribe_stock", {"slug": slug, "title": title})])
         else:
-            rows.append([self.cb(telegram_user_id, "购买", "buy", {"slug": slug})])
+            if self.product_has_stock(product):
+                rows.append([self.cb(telegram_user_id, "购买", "buy", {"slug": slug})])
+            else:
+                rows.append([self.cb(telegram_user_id, "无货，订阅补货", "subscribe_stock", {"slug": slug, "title": title})])
         product_url = self.product_url(product)
         url_row = []
         if product_url:
@@ -641,6 +650,18 @@ class BotApp:
     def start_purchase(self, chat_id: int, telegram_user_id: int, slug: str, sku_id: Any, message: dict[str, Any] | None = None) -> None:
         product = self.dujiao.product_detail(slug)
         skus = self.product_skus(product)
+        if skus:
+            selected_for_check = self.find_sku(skus, sku_id) if sku_id is not None else None
+            if selected_for_check and not self.sku_has_stock(selected_for_check):
+                title = self.product_title(product)
+                rows = [[self.cb(telegram_user_id, "订阅补货", "subscribe_stock", {"slug": slug, "title": title})], [self.cb(telegram_user_id, "返回", "product", {"slug": slug})]]
+                self.send_or_edit(chat_id, message or {}, "这个规格暂时无货，可以订阅补货通知。", inline_keyboard(rows))
+                return
+        elif not self.product_has_stock(product):
+            title = self.product_title(product)
+            rows = [[self.cb(telegram_user_id, "订阅补货", "subscribe_stock", {"slug": slug, "title": title})], [self.cb(telegram_user_id, "返回", "product", {"slug": slug})]]
+            self.send_or_edit(chat_id, message or {}, "这个商品暂时无货，可以订阅补货通知。", inline_keyboard(rows))
+            return
         if sku_id is None and len(skus) > 1:
             rows = [[self.cb(telegram_user_id, self.sku_label(sku), "sku", {"slug": slug, "sku_id": sku.get("id")})] for sku in skus[:20]]
             rows.append([self.cb(telegram_user_id, "返回", "product", {"slug": slug})])
@@ -1355,6 +1376,56 @@ class BotApp:
             total = sum(_int(_first(sku.get("stock"), sku.get("stock_count"), sku.get("available_stock"), default=0)) for sku in skus)
             return str(total)
         return "充足" if product.get("in_stock", True) else "售罄"
+
+    def category_stock_label(self, category_id: Any) -> str:
+        try:
+            result = self.dujiao.products(page=1, page_size=50, category_id=category_id)
+            products = _items(result)
+        except DujiaoError:
+            return "[未知]"
+        if not products:
+            return "[无货]"
+        return "[有货]" if any(self.product_has_stock(product) for product in products) else "[无货]"
+
+    def product_has_stock(self, product: dict[str, Any]) -> bool:
+        for key in ("is_available", "available", "in_stock", "can_buy"):
+            if key in product and isinstance(product.get(key), bool):
+                return bool(product.get(key))
+        status = str(_first(product.get("status"), product.get("sale_status"), product.get("stock_status"), default="")).lower()
+        if status in {"sold_out", "out_of_stock", "disabled", "offline"}:
+            return False
+        skus = self.product_skus(product)
+        if skus:
+            return any(self.sku_has_stock(sku) for sku in skus)
+        for key in (
+            "stock",
+            "stock_count",
+            "available_stock",
+            "inventory",
+            "manual_stock_total",
+            "auto_stock_available",
+            "upstream_stock_available",
+            "stock_available",
+        ):
+            if key in product and product.get(key) is not None:
+                return _int(product.get(key), 0) > 0
+        if status in {"on_sale", "available", "enabled", "online"}:
+            return True
+        return True
+
+    def sku_has_stock(self, sku: dict[str, Any]) -> bool:
+        for key in ("is_available", "available", "in_stock", "can_buy"):
+            if key in sku and isinstance(sku.get(key), bool):
+                return bool(sku.get(key))
+        status = str(_first(sku.get("status"), sku.get("sale_status"), sku.get("stock_status"), default="")).lower()
+        if status in {"sold_out", "out_of_stock", "disabled", "offline"}:
+            return False
+        for key in ("stock", "stock_count", "available_stock", "inventory", "manual_stock", "auto_stock_available", "upstream_stock_available"):
+            if key in sku and sku.get(key) is not None:
+                return _int(sku.get(key), 0) > 0
+        if status in {"on_sale", "available", "enabled", "online"}:
+            return True
+        return True
 
     def product_skus(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         for key in ("skus", "sku_list", "product_skus", "variants"):
