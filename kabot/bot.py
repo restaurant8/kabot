@@ -69,6 +69,7 @@ class BotApp:
         self.telegram = TelegramAPI(settings.telegram_bot_token)
         self.dujiao = DujiaoClient(settings.dujiao_base_url, settings.dujiao_api_prefix, settings.endpoints)
         self.bot_username: str | None = None
+        self._category_stock_cache: tuple[float, dict[str, str]] = (0.0, {})
 
     def init(self) -> None:
         self.db.init()
@@ -510,11 +511,12 @@ class BotApp:
     def show_categories(self, chat_id: int, telegram_user_id: int, message: dict[str, Any] | None = None) -> None:
         result = self.dujiao.categories(page_size=50)
         categories = _items(result)
+        stock_map = self.category_stock_map(categories)
         rows: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         for category in categories:
             label = pick_i18n(category.get("name") or category.get("title"), self.settings.default_locale) or f"分类 {category.get('id')}"
-            stock_label = self.category_stock_label(category.get("id"))
+            stock_label = stock_map.get(str(category.get("id")), "[未知]")
             current.append(self.cb(telegram_user_id, f"{stock_label} {label}"[:32], "products", {"category_id": category.get("id"), "page": 1}))
             if len(current) == 2:
                 rows.append(current)
@@ -1377,15 +1379,54 @@ class BotApp:
             return str(total)
         return "充足" if product.get("in_stock", True) else "售罄"
 
-    def category_stock_label(self, category_id: Any) -> str:
+    def category_stock_map(self, categories: list[dict[str, Any]]) -> dict[str, str]:
+        now = time.time()
+        cached_at, cached = self._category_stock_cache
+        if now - cached_at < 60 and cached:
+            return cached
+        category_ids = {str(category.get("id")) for category in categories if category.get("id") is not None}
+        seen: set[str] = set()
+        stocked: set[str] = set()
         try:
-            result = self.dujiao.products(page=1, page_size=50, category_id=category_id)
+            result = self.dujiao.products(page=1, page_size=200)
             products = _items(result)
         except DujiaoError:
-            return "[未知]"
-        if not products:
-            return "[无货]"
-        return "[有货]" if any(self.product_has_stock(product) for product in products) else "[无货]"
+            return {category_id: "[未知]" for category_id in category_ids}
+        for product in products:
+            product_category_ids = self.product_category_ids(product)
+            for category_id in product_category_ids:
+                if category_id not in category_ids:
+                    continue
+                seen.add(category_id)
+                if self.product_has_stock(product):
+                    stocked.add(category_id)
+        stock_map: dict[str, str] = {}
+        for category_id in category_ids:
+            if category_id in stocked:
+                stock_map[category_id] = "[有货]"
+            elif category_id in seen:
+                stock_map[category_id] = "[无货]"
+            else:
+                stock_map[category_id] = "[未知]"
+        self._category_stock_cache = (now, stock_map)
+        return stock_map
+
+    def product_category_ids(self, product: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for key in ("category_id", "categoryId", "category"):
+            value = product.get(key)
+            if isinstance(value, dict):
+                value = value.get("id")
+            if value is not None and value != "":
+                ids.add(str(value))
+        categories = product.get("categories")
+        if isinstance(categories, list):
+            for category in categories:
+                if isinstance(category, dict) and category.get("id") is not None:
+                    ids.add(str(category.get("id")))
+                elif category is not None and category != "":
+                    ids.add(str(category))
+        return ids
 
     def product_has_stock(self, product: dict[str, Any]) -> bool:
         for key in ("is_available", "available", "in_stock", "can_buy"):
